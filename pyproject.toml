@@ -34,8 +34,6 @@ Repository = "https://github.com/<your-org>/kaldingram"
 [project.scripts]
 kaldingram = "kaldingram.cli:main"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["kaldingram*"]
