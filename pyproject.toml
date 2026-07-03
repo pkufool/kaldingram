@@ -10,8 +10,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
 authors = [
-  { name = "Ruizhe Huang" },
-  { name = "Daniel Povey" }
+  { name = "Next-gen Kaldi Team" }
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -28,8 +27,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/<your-org>/kaldingram"
-Repository = "https://github.com/<your-org>/kaldingram"
+Homepage = "https://github.com/pkufool/kaldingram"
+Repository = "https://github.com/pkufool/kaldingram"
 
 [project.scripts]
 kaldingram = "kaldingram.cli:main"
