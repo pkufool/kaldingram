@@ -11,7 +11,10 @@ import re
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from multiprocessing import Process
+from multiprocessing import Pool
+
+from tqdm import tqdm
+
 
 # For encoding-agnostic scripts, we assume byte stream as input.
 # Need to be very careful about the use of strip() and split()
@@ -97,7 +100,7 @@ class NgramCounts:
     def add_raw_counts_from_standard_input(self):
         lines_processed = 0
         infile = io.TextIOWrapper(sys.stdin.buffer, encoding=default_encoding)
-        for line in infile:
+        for line in tqdm(infile, desc="counting", unit="lines"):
             line = line.strip(strip_chars)
             self.add_raw_counts_from_line(line)
             lines_processed += 1
@@ -109,15 +112,19 @@ class NgramCounts:
             )
 
     def add_raw_counts_from_file(self, filename):
+        file_size = os.path.getsize(filename)
         lines_processed = 0
         with open(filename, encoding=default_encoding) as fp:
-            for line in fp:
-                line = line.strip(strip_chars)
-                if self.ngram_order == 1:
-                    self.add_raw_counts_from_line(line.split()[0])
-                else:
-                    self.add_raw_counts_from_line(line)
-                lines_processed += 1
+            # default_encoding is latin-1, so len(line) (chars) == bytes read.
+            with tqdm(total=file_size, unit="B", unit_scale=True, desc="counting") as pbar:
+                for line in fp:
+                    pbar.update(len(line))
+                    line = line.strip(strip_chars)
+                    if self.ngram_order == 1:
+                        self.add_raw_counts_from_line(line.split()[0])
+                    else:
+                        self.add_raw_counts_from_line(line)
+                    lines_processed += 1
 
         if lines_processed == 0 or self.verbose > 0:
             print(
@@ -128,37 +135,37 @@ class NgramCounts:
     def add_raw_counts_from_file_parallel(self, filename, num_workers):
         """Count n-grams in parallel using byte-range file sharding.
 
-        Workers count independently and write results to temp files.
-        The main process loads and merges each shard sequentially.
+        Workers count independently and write results to temp files (so the
+        large NgramCounts never travels through the IPC pipe; only the line
+        count is returned). Each worker shows its own counting progress bar.
+        Finally the main process loads and merges each shard.
         """
         file_size = os.path.getsize(filename)
         offsets = _compute_shard_offsets(filename, num_workers, file_size)
+        num_shards = len(offsets) - 1
 
         tmp_dir = tempfile.mkdtemp(prefix="kaldingram_")
         tmp_files = [
             os.path.join(tmp_dir, "shard_{}.bin".format(i))
-            for i in range(len(offsets) - 1)
+            for i in range(num_shards)
+        ]
+        worker_args = [
+            (filename, offsets[i], offsets[i + 1], self.ngram_order,
+             self.bos_symbol, self.eos_symbol, tmp_files[i], i)
+            for i in range(num_shards)
         ]
 
-        processes = []
-        for i in range(len(offsets) - 1):
-            p = Process(
-                target=_count_worker,
-                args=(filename, offsets[i], offsets[i + 1], self.ngram_order,
-                      self.bos_symbol, self.eos_symbol, tmp_files[i]),
-            )
-            processes.append(p)
-            p.start()
-
-        for p in processes:
-            p.join()
-
+        # Phase 1: parallel counting; each worker renders its own progress bar.
         total_lines = 0
-        for tmp_file in tmp_files:
+        with Pool(num_workers) as pool:
+            for lines_in_shard in pool.imap_unordered(_count_worker, worker_args):
+                total_lines += lines_in_shard
+
+        # Phase 2: load and merge each shard sequentially.
+        for tmp_file in tqdm(tmp_files, desc="merging", unit="shard"):
             with open(tmp_file, "rb") as f:
-                partial_counts, lines_in_shard = pickle.load(f)
+                partial_counts, _ = pickle.load(f)
             self.merge_counts(partial_counts)
-            total_lines += lines_in_shard
             os.unlink(tmp_file)
         os.rmdir(tmp_dir)
 
@@ -308,30 +315,44 @@ def _compute_shard_offsets(filename, num_shards, file_size):
     return offsets
 
 
-def _count_worker(filename, start, end, ngram_order, bos_symbol, eos_symbol, out_path):
+def _count_worker(args):
     """Worker: count n-grams in a byte range of the file.
 
     Runs add_raw_counts_from_line on each line in the byte range [start, end),
-    then pickles the resulting NgramCounts to out_path.
+    pickles the resulting NgramCounts to out_path, and returns the line count.
+    Only the small line count is sent back through the IPC pipe. Each worker
+    shows its own counting progress bar (positioned by worker index).
     """
+    (filename, start, end, ngram_order, bos_symbol, eos_symbol, out_path,
+     worker_idx) = args
     local_counts = NgramCounts(ngram_order, bos_symbol=bos_symbol, eos_symbol=eos_symbol)
     lines_processed = 0
     with open(filename, "rb") as f:
         f.seek(start)
-        while f.tell() < end:
-            raw_line = f.readline()
-            if not raw_line:
-                break
-            line = raw_line.decode(default_encoding).strip(strip_chars)
-            if ngram_order == 1 and line:
-                parts = line.split()
-                if parts:
-                    local_counts.add_raw_counts_from_line(parts[0])
-            else:
-                local_counts.add_raw_counts_from_line(line)
-            lines_processed += 1
+        with tqdm(
+            total=end - start,
+            position=worker_idx,
+            desc="worker {}".format(worker_idx),
+            unit="B",
+            unit_scale=True,
+            leave=False,
+        ) as pbar:
+            while f.tell() < end:
+                raw_line = f.readline()
+                if not raw_line:
+                    break
+                pbar.update(len(raw_line))
+                line = raw_line.decode(default_encoding).strip(strip_chars)
+                if ngram_order == 1 and line:
+                    parts = line.split()
+                    if parts:
+                        local_counts.add_raw_counts_from_line(parts[0])
+                else:
+                    local_counts.add_raw_counts_from_line(line)
+                lines_processed += 1
     with open(out_path, "wb") as f:
         pickle.dump((local_counts, lines_processed), f, protocol=pickle.HIGHEST_PROTOCOL)
+    return lines_processed
 
 
 def add_arguments(parser):
@@ -342,7 +363,7 @@ def add_arguments(parser):
         choices=[1, 2, 3, 4, 5, 6, 7],
         help="Order of n-gram",
     )
-    parser.add_argument("-text", "--text", type=str, default=None, help="Path to corpus")
+    parser.add_argument("--text", type=str, default=None, help="Path to corpus")
     parser.add_argument(
         "--lm",
         type=str,

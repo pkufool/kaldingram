@@ -12,6 +12,9 @@ license = { text = "Apache-2.0" }
 authors = [
   { name = "Next-gen Kaldi Team" }
 ]
+dependencies = [
+  "tqdm>=4.0",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: Apache Software License",

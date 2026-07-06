@@ -444,7 +444,7 @@ def add_arguments(parser):
         default=1e-6,
         help="Relative perplexity change threshold",
     )
-    parser.add_argument("-lm", "--lm", type=str, required=True, help="Input ARPA file")
+    parser.add_argument("--lm", type=str, required=True, help="Input ARPA file")
     parser.add_argument(
         "-write-lm",
         "--write-lm",
