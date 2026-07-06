@@ -236,13 +236,82 @@ class NgramCounts:
                 stat = Counter(counts_for_hist.word_to_count.values())
                 n1 += stat[1]
                 n2 += stat[2]
-            assert n1 + 2 * n2 > 0
+
+            if n1 + 2 * n2 == 0:
+                # Not enough counts-of-counts to estimate D (e.g. after
+                # aggressive count cutoffs removed all count-1/2 n-grams at
+                # this order, or a very small corpus). Fall back to a small
+                # non-zero discount so that back-off weights remain finite.
+                self.d.append(0.1)
+                continue
 
             # We do this max(0.1, xxx) to avoid a zero discounting constant D
             # due to n1=0, which could happen if the number of symbols is small.
             # Otherwise, a zero discounting constant can cause division by zero
             # in computing BOW.
             self.d.append(max(0.1, float(n1)) / (n1 + 2 * n2))
+
+    def apply_count_cutoffs(self, gtmin):
+        # Remove n-grams whose effective count is below the per-order minimum,
+        # matching SRILM's -gt{N}min option (with -kn-modify-counts-at-end).
+        #
+        # gtmin is a list indexed by order-1 (i.e. gtmin[k] is the minimum
+        # count for (k+1)-grams, k = history length). An n-gram is kept iff its
+        # effective count >= gtmin[k]; the default 0 keeps everything.
+        #
+        # The effective count is the same count used in the probability
+        # computation: the raw count c(a_z) for the highest order, and the
+        # modified (Kneser-Ney) count n(*_z) = number of distinct contexts for
+        # lower orders (falling back to the raw count for <s>-initial histories
+        # that have no modified count).
+        #
+        # Pruning proceeds from high to low order so that, when we decide
+        # whether to keep a lower-order n-gram, its modified count already
+        # reflects any higher-order n-grams that were pruned. Removing an
+        # n-gram (h, w) at order k+1 also discards the context h[0] from the
+        # modified count of the lower-order n-gram (h[1:], w) at order k.
+
+        for k in range(self.ngram_order - 1, -1, -1):
+            order_min = gtmin[k]
+            if order_min <= 0:
+                continue  # no cutoff at this order
+            this_order = self.counts[k]
+            for h in list(this_order.keys()):
+                cfh = this_order[h]
+                to_remove = []
+                for w in list(cfh.word_to_count.keys()):
+                    ctx = cfh.word_to_context.get(w)
+                    if k == self.ngram_order - 1:
+                        eff = cfh.word_to_count[w]  # highest order: raw count
+                    else:
+                        eff = len(ctx) if ctx else cfh.word_to_count[w]
+                    if eff < order_min:
+                        # Backoff closure: keep this n-gram if any surviving
+                        # higher-order n-gram backs off to it. ctx (already
+                        # cascaded from higher-order pruning) holds exactly the
+                        # surviving references; if it is non-empty we must keep
+                        # (h, w) so the backoff path stays valid.
+                        if ctx:
+                            continue
+                        to_remove.append(w)
+
+                for w in to_remove:
+                    del cfh.word_to_count[w]
+                    cfh.word_to_context.pop(w, None)
+                    # Cascade: this (k+1)-gram (h, w) contributed the context
+                    # h[0] to the modified count of the lower-order k-gram
+                    # (h[1:], w) stored at counts[k-1].
+                    if k >= 1:
+                        lower = self.counts[k - 1].get(h[1:])
+                        if lower is not None:
+                            lower_ctx = lower.word_to_context.get(w)
+                            if lower_ctx is not None:
+                                lower_ctx.discard(h[0])
+
+                if to_remove:
+                    cfh.total_count = sum(cfh.word_to_count.values())
+                if not cfh.word_to_count:
+                    del this_order[h]
 
     def cal_f(self):
         # f(a_z) is a probability distribution of word sequence a_z.
@@ -312,7 +381,12 @@ class NgramCounts:
                         a_ = hist + (w,)
 
                         assert len(a_) < self.ngram_order
-                        assert a_ in self.counts[len(a_)].keys()
+                        if a_ not in self.counts[len(a_)]:
+                            # No longer n-gram uses (hist, w) as context (e.g.
+                            # after count cutoffs pruned all of its extensions),
+                            # so no back-off weight is needed for this n-gram.
+                            counts_for_hist.word_to_bow[w] = None
+                            continue
 
                         a_counts_for_hist = self.counts[len(a_)][a_]
 
@@ -435,7 +509,7 @@ def add_arguments(parser):
         "--ngram-order",
         type=int,
         default=4,
-        choices=[1, 2, 3, 4, 5, 6, 7],
+        choices=[1, 2, 3, 4, 5],
         help="Order of n-gram",
     )
     parser.add_argument("--text", type=str, default=None, help="Path to corpus")
@@ -458,6 +532,19 @@ def add_arguments(parser):
         default=1,
         help="Number of parallel workers for counting (default: 1, set 0 for auto)",
     )
+    # Count cutoffs, matching SRILM's -gt{N}min (with -kn-modify-counts-at-end).
+    # An n-gram is dropped if its effective count is below the threshold for its
+    # order; the default 0 keeps everything (backwards compatible). The highest
+    # order thresholds on the raw count, lower orders on the modified count.
+    # Values > 2 are not recommended (they can leave too few counts-of-counts to
+    # estimate the discounting constants).
+    for _n in range(1, 6):
+        parser.add_argument(
+            "--gt{}min".format(_n),
+            type=int,
+            default=0,
+            help="Minimum count for {}-grams (default: 0, keep all)".format(_n),
+        )
 
 
 def run(args):
@@ -475,6 +562,13 @@ def run(args):
     else:
         assert os.path.isfile(args.text)
         ngram_counts.add_raw_counts_from_file(args.text)
+
+    # Apply per-order count cutoffs (SRILM -gt{N}min) before discounting so
+    # that discounting constants and probabilities are estimated from the
+    # pruned model.
+    gtmin = [getattr(args, "gt{}min".format(n)) for n in range(1, args.ngram_order + 1)]
+    if any(g > 0 for g in gtmin):
+        ngram_counts.apply_count_cutoffs(gtmin)
 
     ngram_counts.cal_discounting_constants()
     ngram_counts.cal_f()
