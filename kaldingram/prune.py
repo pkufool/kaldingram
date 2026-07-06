@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#
+# Copyright 2021  Johns Hopkins University (Author: Ruizhe Huang)
+#           2026  XiaoMi Corp. (Author: Wei Kang)
 
-"""Entropy-based pruning for back-off n-gram ARPA language models."""
+"""Entropy-based pruning for back-off n-gram ARPA language models.
+
+This is an implementation of ``Entropy-based Pruning of Backoff Language
+Models'' (Stolcke) in the same way as SRILM. An n-gram entry is removed if
+the removal causes the (training-set) perplexity of the model to increase by
+less than ``threshold`` relative.
+
+Usage:
+    kaldingram prune --threshold 1e-8 --lm 4gram.arpa --write-lm 4gram_pruned.arpa
+
+Originally from Kaldi ``egs/wsj/s5/utils/lang/ngram_entropy_pruning.py``;
+the Arpa data structure is modified based on Stefan Fischer's python-arpa
+(https://github.com/sfischer13/python-arpa).
+"""
 
 import argparse
 import gzip
@@ -14,7 +30,11 @@ from io import StringIO
 
 
 class Context(dict):
-    """Store values for one context h and its back-off weight."""
+    """
+    This class stores data for a context h.
+    It behaves like a python dict object, except that it has several
+    additional attributes.
+    """
 
     def __init__(self):
         super().__init__()
@@ -22,7 +42,11 @@ class Context(dict):
 
 
 class Arpa:
-    """Data structure for an ARPA language model."""
+    """
+    This is a class that implements the data structure of an ARPA LM.
+    It (as well as some other classes) is modified based on the library
+    by Stefan Fischer: https://github.com/sfischer13/python-arpa
+    """
 
     UNK = "<unk>"
     SOS = "<s>"
@@ -54,6 +78,7 @@ class Arpa:
 
     def __init__(self, path=None, encoding=None, unk=None):
         self._counts = OrderedDict()
+        # Use self._ngrams[len(h)][h][w] for saving the entry of (h,w)
         self._ngrams = OrderedDict()
         self._vocabulary = set()
         if unk is None:
@@ -63,8 +88,8 @@ class Arpa:
             self.loadf(path, encoding)
 
     def __contains__(self, ngram):
-        h = ngram[:-1]
-        w = ngram[-1]
+        h = ngram[:-1]  # h is a tuple
+        w = ngram[-1]  # w is a string/word
         return h in self._ngrams[len(h)] and w in self._ngrams[len(h)][h]
 
     def contains_word(self, word):
@@ -82,10 +107,12 @@ class Arpa:
                 self._counts[order] = count
 
     def add_entry(self, ngram, p, bo=None, order=None):
+        # Note: ngram is a tuple of strings, e.g. ("w1", "w2", "w3")
         del order
-        h = ngram[:-1]
-        w = ngram[-1]
+        h = ngram[:-1]  # h is a tuple
+        w = ngram[-1]  # w is a string/word
 
+        # Note that p and bo here are in fact in the log domain (self.base = 10)
         h_context = self._ngrams[len(h)][h]
         h_context[w] = p
         if bo is not None:
@@ -113,6 +140,7 @@ class Arpa:
         )
 
     def _entry(self, h, w):
+        # return the entry for the ngram (h, w)
         ngram = h + (w,)
         log_p = self._ngrams[len(h)][h][w]
         log_bo = self._log_bo(ngram)
@@ -150,12 +178,20 @@ class Arpa:
         return log_bo + self.log_p_raw(ngram[1:])
 
     def log_joint_prob(self, sequence):
+        # Compute the joint prob of the sequence based on the chain rule
+        # Note that sequence should be a tuple of strings
+        #
+        # Reference:
+        # https://github.com/BitSpeech/SRILM/blob/d571a4424fb0cf08b29fbfccfddd092ea969eae3/lm/src/LM.cc#L527
         log_joint_p = 0
         seq = sequence
         while len(seq) > 0:
             log_joint_p += self.log_p_raw(seq)
             seq = seq[:-1]
 
+            # If we're computing the marginal probability of the unigram
+            # <s> context we have to look up </s> instead since the former
+            # has prob = 0.
             if len(seq) == 1 and seq[0] == self.SOS:
                 seq = (self.EOS,)
 
@@ -213,7 +249,7 @@ class Arpa:
 
 
 class ArpaParser:
-    """Parser and serializer for ARPA files."""
+    """This is a class that implements a parser of an arpa file."""
 
     @unique
     class State(Enum):
@@ -254,6 +290,8 @@ class ArpaParser:
         if line == "\\data\\":
             self._state = self.State.COUNT
             self._tmp_model = Arpa()
+        else:
+            pass  # skip comment line
 
     def _count(self, line):
         match = self.re_count.match(line)
@@ -262,7 +300,7 @@ class ArpaParser:
             count = match.group(2)
             self._tmp_model.add_count(int(order), int(count))
         elif not line:
-            self._state = self.State.HEADER
+            self._state = self.State.HEADER  # there are no counts
         else:
             raise Exception(line)
 
@@ -277,7 +315,7 @@ class ArpaParser:
             self._tmp_model = None
             self._tmp_order = None
         elif not line:
-            pass
+            pass  # skip empty line
         else:
             raise Exception(line)
 
@@ -290,7 +328,7 @@ class ArpaParser:
             bo = self._float_or_int(bo_match) if bo_match else None
             self._tmp_model.add_entry(ngram, p, bo, self._tmp_order)
         elif not line:
-            self._state = self.State.HEADER
+            self._state = self.State.HEADER  # last entry
         else:
             raise Exception(line)
 
@@ -298,14 +336,16 @@ class ArpaParser:
     def _float_or_int(s):
         f = float(s)
         i = int(f)
-        if str(i) == s:
+        if str(i) == s:  # don't drop trailing ".0"
             return i
         return f
 
     def load(self, fp):
+        """Deserialize fp (a file-like object) to a Python object."""
         return self._parse(fp)
 
     def loadf(self, path, encoding=None):
+        """Deserialize path (.arpa, .gz) to a Python object."""
         path = str(path)
         if path.endswith(".gz"):
             with gzip.open(path, mode="rt", encoding=encoding) as f:
@@ -314,13 +354,16 @@ class ArpaParser:
             return self.load(f)
 
     def loads(self, s):
+        """Deserialize s (a str) to a Python object."""
         with StringIO(s) as f:
             return self.load(f)
 
     def dump(self, obj, fp):
+        """Serialize obj to fp (a file-like object) in ARPA format."""
         obj.write(fp)
 
     def dumpf(self, obj, path, encoding=None):
+        """Serialize obj to path in ARPA format (.arpa, .gz)."""
         path = str(path)
         if path.endswith(".gz"):
             with gzip.open(path, mode="wt", encoding=encoding) as f:
@@ -329,6 +372,7 @@ class ArpaParser:
             self.dump(obj, f)
 
     def dumps(self, obj):
+        """Serialize obj to an ARPA formatted str."""
         with StringIO() as f:
             self.dump(obj, f)
             return f.getvalue()
@@ -355,17 +399,30 @@ def compute_numerator_denominator(lm, h):
 
 
 def prune(lm, threshold, minorder):
-    for i in range(lm.order(), max(minorder - 1, 1), -1):
+    # Reference:
+    # https://github.com/BitSpeech/SRILM/blob/d571a4424fb0cf08b29fbfccfddd092ea969eae3/lm/src/NgramLM.cc#L2330
+
+    for i in range(
+        lm.order(), max(minorder - 1, 1), -1
+    ):  # i is the order of the ngram (h, w)
         logging.info("processing %d-grams ...", i)
         count_pruned_ngrams = 0
 
         h_dict = lm._ngrams[i - 1]
         for h in list(h_dict.keys()):
+            # old backoff weight, BOW(h)
             log_bow = lm._log_bo(h)
             if log_bow is None:
                 log_bow = 0
 
+            # Compute numerator and denominator of the backoff weight,
+            # so that we can quickly compute the BOW adjustment due to
+            # leaving out one prob.
             numerator, denominator = compute_numerator_denominator(lm, h)
+
+            # assert abs(math.log(numerator, lm.base) - math.log(denominator, lm.base) - h_dict[h].log_bo) < 1e-5
+
+            # Compute the marginal probability of the context, P(h)
             h_log_p = lm.log_joint_prob(h)
 
             all_pruned = True
@@ -373,22 +430,28 @@ def prune(lm, threshold, minorder):
 
             for w, log_p in h_dict[h].items():
                 ngram = h + (w,)
+
+                # lower-order estimate for ngramProb, P(w|h')
                 backoff_prob = lm.log_p_raw(ngram[1:])
 
+                # Compute BOW after removing ngram, BOW'(h)
                 new_log_bow = math.log(
                     numerator + lm.base**log_p, lm.base
                 ) - math.log(denominator + lm.base**backoff_prob, lm.base)
 
+                # Compute change in entropy due to removal of ngram
                 delta_prob = backoff_prob + new_log_bow - log_p
                 delta_entropy = -(lm.base**h_log_p) * (
                     (lm.base**log_p) * delta_prob
                     + numerator * (new_log_bow - log_bow)
                 )
 
+                # compute relative change in model (training set) perplexity
                 perp_change = lm.base**delta_entropy - 1.0
 
                 pruned = threshold > 0 and perp_change < threshold
 
+                # Make sure we don't prune ngrams whose backoff nodes are needed
                 if (
                     pruned
                     and len(ngram) in lm._ngrams
@@ -416,29 +479,46 @@ def prune(lm, threshold, minorder):
                 else:
                     all_pruned = False
 
+            # If we removed all ngrams for this context we can
+            # remove the context itself, but only if the present
+            # context is not a prefix to a longer one.
             if all_pruned and len(pruned_w_set) == len(h_dict[h]):
-                del h_dict[h]
+                del h_dict[
+                    h
+                ]  # this context h is no longer needed, as its ngram prob is stored at its own context h'
             elif len(pruned_w_set) > 0:
+                # The pruning for this context h is actually done here
                 old_context = lm.set_new_context(h)
 
                 for w, p_w in old_context.items():
                     if w not in pruned_w_set:
-                        lm.add_entry(h + (w,), p_w)
+                        lm.add_entry(
+                            h + (w,), p_w
+                        )  # the entry hw is stored at the context h
+
+                # We need to recompute the back-off weight, but
+                # this can only be done after completing the pruning
+                # of the lower-order ngrams.
+                # Reference:
+                # https://github.com/BitSpeech/SRILM/blob/d571a4424fb0cf08b29fbfccfddd092ea969eae3/flm/src/FNgramLM.cc#L2124
 
         logging.info("pruned %d %d-grams", count_pruned_ngrams, i)
 
-    for i in range(max(minorder - 1, 1) + 1, lm.order() + 1):
+    # recompute backoff weights
+    for i in range(
+        max(minorder - 1, 1) + 1, lm.order() + 1
+    ):  # be careful of this order: from low- to high-order
         for h in lm._ngrams[i - 1]:
             numerator, denominator = compute_numerator_denominator(lm, h)
             new_log_bow = math.log(numerator, lm.base) - math.log(denominator, lm.base)
             lm._ngrams[len(h)][h].log_bo = new_log_bow
 
+    # update counts
     lm.update_counts()
 
 
 def add_arguments(parser):
     parser.add_argument(
-        "-threshold",
         "--threshold",
         type=float,
         default=1e-6,
@@ -446,28 +526,24 @@ def add_arguments(parser):
     )
     parser.add_argument("--lm", type=str, required=True, help="Input ARPA file")
     parser.add_argument(
-        "-write-lm",
         "--write-lm",
         type=str,
         required=True,
         help="Output ARPA path after pruning",
     )
     parser.add_argument(
-        "-minorder",
         "--minorder",
         type=int,
         default=1,
         help="Only prune n-grams with this order and above",
     )
     parser.add_argument(
-        "-encoding",
         "--encoding",
         type=str,
         default="utf-8",
         help="Encoding of the ARPA file",
     )
     parser.add_argument(
-        "-verbose",
         "--verbose",
         type=int,
         default=2,
