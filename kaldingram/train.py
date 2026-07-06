@@ -336,7 +336,6 @@ def _count_worker(filename, start, end, ngram_order, bos_symbol, eos_symbol, out
 
 def add_arguments(parser):
     parser.add_argument(
-        "-ngram-order",
         "--ngram-order",
         type=int,
         default=4,
@@ -345,14 +344,12 @@ def add_arguments(parser):
     )
     parser.add_argument("-text", "--text", type=str, default=None, help="Path to corpus")
     parser.add_argument(
-        "-lm",
         "--lm",
         type=str,
         default=None,
         help="Path to output ARPA LM",
     )
     parser.add_argument(
-        "-verbose",
         "--verbose",
         type=int,
         default=0,
@@ -360,7 +357,6 @@ def add_arguments(parser):
         help="Verbose level",
     )
     parser.add_argument(
-        "-num-workers",
         "--num-workers",
         type=int,
         default=1,
