@@ -33,6 +33,13 @@ cat corpus.txt | kaldingram train --ngram-order 3 > 3gram.arpa
 kaldingram prune --threshold 1e-8 --lm 4gram.arpa --write-lm 4gram_pruned.arpa
 ```
 
+### Evaluate perplexity
+
+```bash
+kaldingram ppl --lm 4gram.arpa --text test.txt
+cat test.txt | kaldingram ppl --lm 4gram.arpa
+```
+
 ## Development
 
 Build package locally:

@@ -5,6 +5,7 @@
 import argparse
 
 from . import __version__
+from . import ppl as ppl_cmd
 from . import prune as prune_cmd
 from . import train as train_cmd
 
@@ -12,7 +13,7 @@ from . import train as train_cmd
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="kaldingram",
-        description="Train and prune n-gram language models.",
+        description="Train, prune, and evaluate n-gram language models.",
     )
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
 
@@ -31,6 +32,13 @@ def build_parser():
     )
     prune_cmd.add_arguments(prune_parser)
     prune_parser.set_defaults(func=prune_cmd.run)
+
+    ppl_parser = subparsers.add_parser(
+        "ppl",
+        help="Compute perplexity of an ARPA model on held-out text",
+    )
+    ppl_cmd.add_arguments(ppl_parser)
+    ppl_parser.set_defaults(func=ppl_cmd.run)
 
     return parser
 

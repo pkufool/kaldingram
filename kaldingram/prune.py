@@ -50,7 +50,7 @@ class Arpa:
             raise ValueError
 
     def _replace_unks(self, words):
-        return tuple((w if w in self else self._unk) for w in words)
+        return tuple((w if self.contains_word(w) else self._unk) for w in words)
 
     def __init__(self, path=None, encoding=None, unk=None):
         self._counts = OrderedDict()
@@ -132,7 +132,7 @@ class Arpa:
     def _log_p(self, ngram):
         h = ngram[:-1]
         w = ngram[-1]
-        if h in self._ngrams[len(h)] and w in self._ngrams[len(h)][h]:
+        if len(h) < len(self._ngrams) and h in self._ngrams[len(h)] and w in self._ngrams[len(h)][h]:
             return self._ngrams[len(h)][h][w]
         return None
 

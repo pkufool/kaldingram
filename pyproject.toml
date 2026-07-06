@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kaldingram"
-version = "0.1.0"
+version = "0.1.1"
 description = "Train and entropy-prune ARPA n-gram language models"
 readme = "README.md"
 requires-python = ">=3.8"
