@@ -138,9 +138,14 @@ class NgramCounts:
         union.
         """
         assert self.ngram_order == other.ngram_order
-        for n in range(self.ngram_order):
+        for n in tqdm(range(self.ngram_order), desc="merge", unit="order", leave=False):
             this_order = self.counts[n]
-            for history, other_hist in other.counts[n].items():
+            for history, other_hist in tqdm(
+                other.counts[n].items(),
+                desc="  {}-gram".format(n + 1),
+                unit="hist",
+                leave=False,
+            ):
                 my_hist = this_order.get(history)
                 if my_hist is None:
                     this_order[history] = other_hist
