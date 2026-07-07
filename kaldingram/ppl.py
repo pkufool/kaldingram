@@ -8,6 +8,8 @@ import math
 import os
 import sys
 
+from tqdm import tqdm
+
 from .prune import ArpaParser
 
 default_encoding = "latin-1"
@@ -38,7 +40,7 @@ def compute_ppl(lm, lines, verbose=0):
 
     unk_token = lm._unk
 
-    for lineno, line in enumerate(lines, 1):
+    for lineno, line in enumerate(tqdm(lines, desc="scoring", unit="sent"), 1):
         line = line.strip(strip_chars)
         if not line:
             continue

@@ -295,11 +295,16 @@ class NgramCounts:
         # having seen all vocabularies in the dictionary, but perhaps this is
         # not the case for some other scenarios.
         self.d = [0]
-        for n in range(1, self.ngram_order):
+        for n in tqdm(range(1, self.ngram_order), desc="discounting", unit="order"):
             this_order_counts = self.counts[n]
             n1 = 0
             n2 = 0
-            for _, counts_for_hist in this_order_counts.items():
+            for _, counts_for_hist in tqdm(
+                this_order_counts.items(),
+                desc="  {}-gram".format(n + 1),
+                unit="hist",
+                leave=False,
+            ):
                 stat = Counter(counts_for_hist.word_to_count.values())
                 n1 += stat[1]
                 n2 += stat[2]
@@ -338,12 +343,21 @@ class NgramCounts:
         # n-gram (h, w) at order k+1 also discards the context h[0] from the
         # modified count of the lower-order n-gram (h[1:], w) at order k.
 
-        for k in range(self.ngram_order - 1, -1, -1):
+        for k in tqdm(
+            range(self.ngram_order - 1, -1, -1),
+            desc="count cutoffs",
+            unit="order",
+        ):
             order_min = gtmin[k]
             if order_min <= 0:
                 continue  # no cutoff at this order
             this_order = self.counts[k]
-            for h in list(this_order.keys()):
+            for h in tqdm(
+                list(this_order.keys()),
+                desc="  {}-gram".format(k + 1),
+                unit="hist",
+                leave=False,
+            ):
                 cfh = this_order[h]
                 to_remove = []
                 for w in list(cfh.word_to_count.keys()):
@@ -392,16 +406,25 @@ class NgramCounts:
         # highest order N-grams
         n = self.ngram_order - 1
         this_order_counts = self.counts[n]
-        for _, counts_for_hist in this_order_counts.items():
+        for _, counts_for_hist in tqdm(
+            this_order_counts.items(),
+            desc="cal_f {}-gram".format(n + 1),
+            unit="hist",
+        ):
             for w, c in counts_for_hist.word_to_count.items():
                 counts_for_hist.word_to_f[w] = (
                     max((c - self.d[n]), 0) * 1.0 / counts_for_hist.total_count
                 )
 
         # lower order N-grams
-        for n in range(0, self.ngram_order - 1):
+        for n in tqdm(range(0, self.ngram_order - 1), desc="cal_f", unit="order"):
             this_order_counts = self.counts[n]
-            for _, counts_for_hist in this_order_counts.items():
+            for _, counts_for_hist in tqdm(
+                this_order_counts.items(),
+                desc="  {}-gram".format(n + 1),
+                unit="hist",
+                leave=False,
+            ):
                 n_star_star = 0
                 for w in counts_for_hist.word_to_count.keys():
                     n_star_star += len(counts_for_hist.word_to_context[w])
@@ -433,14 +456,23 @@ class NgramCounts:
         # highest order N-grams
         n = self.ngram_order - 1
         this_order_counts = self.counts[n]
-        for _, counts_for_hist in this_order_counts.items():
+        for _, counts_for_hist in tqdm(
+            this_order_counts.items(),
+            desc="cal_bow {}-gram".format(n + 1),
+            unit="hist",
+        ):
             for w in counts_for_hist.word_to_count.keys():
                 counts_for_hist.word_to_bow[w] = None
 
         # lower order N-grams
-        for n in range(0, self.ngram_order - 1):
+        for n in tqdm(range(0, self.ngram_order - 1), desc="cal_bow", unit="order"):
             this_order_counts = self.counts[n]
-            for hist, counts_for_hist in this_order_counts.items():
+            for hist, counts_for_hist in tqdm(
+                this_order_counts.items(),
+                desc="  {}-gram".format(n + 1),
+                unit="hist",
+                leave=False,
+            ):
                 for w in counts_for_hist.word_to_count.keys():
                     if w == self.eos_symbol:
                         counts_for_hist.word_to_bow[w] = None
@@ -497,11 +529,16 @@ class NgramCounts:
 
         print("", file=fout)
 
-        for hist_len in range(self.ngram_order):
+        for hist_len in tqdm(range(self.ngram_order), desc="print_arpa", unit="order"):
             print("\\{0}-grams:".format(hist_len + 1), file=fout)
 
             this_order_counts = self.counts[hist_len]
-            for hist, counts_for_hist in this_order_counts.items():
+            for hist, counts_for_hist in tqdm(
+                this_order_counts.items(),
+                desc="  {}-gram".format(hist_len + 1),
+                unit="hist",
+                leave=False,
+            ):
                 for word in counts_for_hist.word_to_count.keys():
                     ngram = hist + (word,)
                     prob = counts_for_hist.word_to_f[word]

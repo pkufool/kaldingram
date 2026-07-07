@@ -23,10 +23,13 @@ import argparse
 import gzip
 import logging
 import math
+import os
 import re
 from collections import OrderedDict, defaultdict
 from enum import Enum, unique
 from io import StringIO
+
+from tqdm import tqdm
 
 
 class Context(dict):
@@ -232,9 +235,14 @@ class Arpa:
         for order, count in self.counts():
             fp.write("ngram {}={}\n".format(order, count))
         fp.write("\n")
-        for order, _ in self.counts():
+        for order, _ in tqdm(self.counts(), desc="write arpa", unit="order"):
             fp.write("\\{}-grams:\n".format(order))
-            for e in self._entries(order):
+            for e in tqdm(
+                self._entries(order),
+                desc="  {}-gram".format(order),
+                unit="entry",
+                leave=False,
+            ):
                 prob = e[0]
                 ngram = " ".join(e[1])
                 if len(e) == 2:
@@ -246,6 +254,38 @@ class Arpa:
                     raise ValueError
             fp.write("\n")
         fp.write("\\end\\\n")
+
+
+# ARPA files are repetitive text (repeated tokens, decimal probabilities), so
+# their gzip compression ratio is fairly stable around this factor.  We use it
+# to estimate the uncompressed size of a .gz LM from its compressed size, which
+# lets the loading progress bar stay roughly meaningful for gzip input.  The
+# estimate only drives a progress bar, so over/undershooting is harmless.
+GZ_COMPRESSION_FACTOR = 3.5
+
+
+def _iter_arpa_lines(fp, total=None, encoding=None):
+    """Yield lines from ``fp`` while showing a tqdm progress bar.
+
+    When ``total`` (file size in bytes) is known, mirror train.py's counting
+    bar: drive a byte-scaled bar by re-encoding each line, batching updates so
+    the bar refreshes at most roughly once per MiB.  When ``total`` is unknown
+    (in-memory strings) fall back to a plain line counter.
+    """
+    if total:
+        with tqdm(total=total, unit="B", unit_scale=True, desc="loading") as pbar:
+            pending = 0
+            for line in fp:
+                pending += len(line.encode(encoding)) if encoding else len(line)
+                if pending >= 1024 * 1024:
+                    pbar.update(pending)
+                    pending = 0
+                yield line
+            if pending:
+                pbar.update(pending)
+    else:
+        for line in tqdm(fp, desc="loading", unit="lines"):
+            yield line
 
 
 class ArpaParser:
@@ -267,12 +307,12 @@ class ArpaParser:
         "(\\t((-?\\d+(\\.\\d+)?)([eE]-?\\d+)?))?$"
     )
 
-    def _parse(self, fp):
+    def _parse(self, fp, total=None, encoding=None):
         self._result = []
         self._state = self.State.DATA
         self._tmp_model = None
         self._tmp_order = None
-        for line in fp:
+        for line in _iter_arpa_lines(fp, total, encoding):
             line = line.strip()
             if self._state == self.State.DATA:
                 self._data(line)
@@ -340,18 +380,23 @@ class ArpaParser:
             return i
         return f
 
-    def load(self, fp):
+    def load(self, fp, total=None, encoding=None):
         """Deserialize fp (a file-like object) to a Python object."""
-        return self._parse(fp)
+        return self._parse(fp, total, encoding)
 
     def loadf(self, path, encoding=None):
         """Deserialize path (.arpa, .gz) to a Python object."""
         path = str(path)
         if path.endswith(".gz"):
+            # gzip does not expose the uncompressed size cheaply; estimate it
+            # from the compressed size times a typical ARPA compression factor
+            # so the byte bar stays roughly meaningful (it may over/undershoot).
+            total = int(os.path.getsize(path) * GZ_COMPRESSION_FACTOR)
             with gzip.open(path, mode="rt", encoding=encoding) as f:
-                return self.load(f)
+                return self.load(f, total=total, encoding=encoding)
+        total = os.path.getsize(path)
         with open(path, mode="rt", encoding=encoding) as f:
-            return self.load(f)
+            return self.load(f, total=total, encoding=encoding)
 
     def loads(self, s):
         """Deserialize s (a str) to a Python object."""
@@ -402,14 +447,21 @@ def prune(lm, threshold, minorder):
     # Reference:
     # https://github.com/BitSpeech/SRILM/blob/d571a4424fb0cf08b29fbfccfddd092ea969eae3/lm/src/NgramLM.cc#L2330
 
-    for i in range(
-        lm.order(), max(minorder - 1, 1), -1
+    for i in tqdm(
+        range(lm.order(), max(minorder - 1, 1), -1),
+        desc="pruning",
+        unit="order",
     ):  # i is the order of the ngram (h, w)
         logging.info("processing %d-grams ...", i)
         count_pruned_ngrams = 0
 
         h_dict = lm._ngrams[i - 1]
-        for h in list(h_dict.keys()):
+        for h in tqdm(
+            list(h_dict.keys()),
+            desc="  {}-gram".format(i),
+            unit="ctx",
+            leave=False,
+        ):
             # old backoff weight, BOW(h)
             log_bow = lm._log_bo(h)
             if log_bow is None:
@@ -505,10 +557,17 @@ def prune(lm, threshold, minorder):
         logging.info("pruned %d %d-grams", count_pruned_ngrams, i)
 
     # recompute backoff weights
-    for i in range(
-        max(minorder - 1, 1) + 1, lm.order() + 1
+    for i in tqdm(
+        range(max(minorder - 1, 1) + 1, lm.order() + 1),
+        desc="recompute BOW",
+        unit="order",
     ):  # be careful of this order: from low- to high-order
-        for h in lm._ngrams[i - 1]:
+        for h in tqdm(
+            lm._ngrams[i - 1],
+            desc="  {}-gram".format(i),
+            unit="ctx",
+            leave=False,
+        ):
             numerator, denominator = compute_numerator_denominator(lm, h)
             new_log_bow = math.log(numerator, lm.base) - math.log(denominator, lm.base)
             lm._ngrams[len(h)][h].log_bo = new_log_bow
