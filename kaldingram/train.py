@@ -21,11 +21,13 @@ The smoothing algorithm is based on:
 """
 
 import argparse
+import gc
 import io
 import math
 import os
 import pickle
 import re
+import shutil
 import sys
 import tempfile
 from collections import Counter, defaultdict
@@ -43,6 +45,28 @@ default_encoding = "latin-1"
 
 strip_chars = " \t\r\n"
 whitespace = re.compile("[ \t]+")
+
+
+class _GcSuspended:
+    """Temporarily suspend cyclic GC around object-heavy hot loops.
+
+    Counting creates millions of dictionaries, tuples and sets, but they do not
+    form reference cycles.  CPython's reference counting is enough to reclaim
+    them, while periodic cyclic-GC scans become very expensive as the count
+    tables grow.  Keep the previous GC state so callers/tests that deliberately
+    disabled GC stay unchanged.
+    """
+
+    def __enter__(self):
+        self._was_enabled = gc.isenabled()
+        if self._was_enabled:
+            gc.disable()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._was_enabled:
+            gc.enable()
+        return False
 
 
 class CountsForHistory:
@@ -86,8 +110,8 @@ class NgramCounts:
 
         self.ngram_order = ngram_order
         self.verbose = verbose
-        self.bos_symbol = bos_symbol
-        self.eos_symbol = eos_symbol
+        self.bos_symbol = sys.intern(bos_symbol)
+        self.eos_symbol = sys.intern(eos_symbol)
 
         self.counts = []
         for _ in range(ngram_order):
@@ -103,16 +127,38 @@ class NgramCounts:
         self.counts[len(history)][history].add_count(predicted_word, context_word, count)
 
     def merge_counts(self, other):
-        """Merge counts from another NgramCounts instance into this one."""
+        """Merge counts from another NgramCounts instance into this one.
+
+        This is on the hot path of parallel training.  Most high-order
+        histories are owned by a single shard, so move those
+        CountsForHistory objects wholesale instead of recreating an empty
+        history and copying every word/context in Python.  When a history is
+        shared, also move per-word context sets for words that are not yet
+        present; only the genuinely overlapping entries need arithmetic/set
+        union.
+        """
         assert self.ngram_order == other.ngram_order
         for n in range(self.ngram_order):
+            this_order = self.counts[n]
             for history, other_hist in other.counts[n].items():
-                my_hist = self.counts[n][history]
-                for word, count in other_hist.word_to_count.items():
-                    my_hist.word_to_count[word] += count
-                for word, contexts in other_hist.word_to_context.items():
-                    my_hist.word_to_context[word] |= contexts
+                my_hist = this_order.get(history)
+                if my_hist is None:
+                    this_order[history] = other_hist
+                    continue
+
                 my_hist.total_count += other_hist.total_count
+
+                my_word_to_count = my_hist.word_to_count
+                for word, count in other_hist.word_to_count.items():
+                    my_word_to_count[word] += count
+
+                my_word_to_context = my_hist.word_to_context
+                for word, contexts in other_hist.word_to_context.items():
+                    my_contexts = my_word_to_context.get(word)
+                    if my_contexts is None:
+                        my_word_to_context[word] = contexts
+                    else:
+                        my_contexts.update(contexts)
 
     # 'line' is a string containing a sequence of tokens.
     # This function adds the un-smoothed counts from this line of text.
@@ -120,7 +166,15 @@ class NgramCounts:
         if line == "":
             words = [self.bos_symbol, self.eos_symbol]
         else:
-            words = [self.bos_symbol] + whitespace.split(line) + [self.eos_symbol]
+            # Intern tokens so repeated vocabulary items share one Python string
+            # object inside a process.  This reduces memory, speeds dict/tuple
+            # comparisons, and makes pickle files for worker shards much smaller
+            # because pickle can memoize repeated token objects by identity.
+            words = (
+                [self.bos_symbol]
+                + [sys.intern(w) for w in whitespace.split(line)]
+                + [self.eos_symbol]
+            )
 
         for i in range(len(words)):
             for n in range(1, self.ngram_order + 1):
@@ -140,10 +194,11 @@ class NgramCounts:
         lines_processed = 0
         # byte stream as input
         infile = io.TextIOWrapper(sys.stdin.buffer, encoding=default_encoding)
-        for line in tqdm(infile, desc="counting", unit="lines"):
-            line = line.strip(strip_chars)
-            self.add_raw_counts_from_line(line)
-            lines_processed += 1
+        with _GcSuspended():
+            for line in tqdm(infile, desc="counting", unit="lines"):
+                line = line.strip(strip_chars)
+                self.add_raw_counts_from_line(line)
+                lines_processed += 1
 
         if lines_processed == 0 or self.verbose > 0:
             print(
@@ -154,17 +209,24 @@ class NgramCounts:
     def add_raw_counts_from_file(self, filename):
         file_size = os.path.getsize(filename)
         lines_processed = 0
-        with open(filename, encoding=default_encoding) as fp:
-            # default_encoding is latin-1, so len(line) (chars) == bytes read.
-            with tqdm(total=file_size, unit="B", unit_scale=True, desc="counting") as pbar:
-                for line in fp:
-                    pbar.update(len(line))
-                    line = line.strip(strip_chars)
-                    if self.ngram_order == 1:
-                        self.add_raw_counts_from_line(line.split()[0])
-                    else:
-                        self.add_raw_counts_from_line(line)
-                    lines_processed += 1
+        with _GcSuspended():
+            with open(filename, encoding=default_encoding) as fp:
+                # default_encoding is latin-1, so len(line) (chars) == bytes read.
+                with tqdm(total=file_size, unit="B", unit_scale=True, desc="counting") as pbar:
+                    pending_update = 0
+                    for line in fp:
+                        pending_update += len(line)
+                        if pending_update >= 1024 * 1024:
+                            pbar.update(pending_update)
+                            pending_update = 0
+                        line = line.strip(strip_chars)
+                        if self.ngram_order == 1:
+                            self.add_raw_counts_from_line(line.split()[0])
+                        else:
+                            self.add_raw_counts_from_line(line)
+                        lines_processed += 1
+                    if pending_update:
+                        pbar.update(pending_update)
 
         if lines_processed == 0 or self.verbose > 0:
             print(
@@ -195,19 +257,24 @@ class NgramCounts:
             for i in range(num_shards)
         ]
 
-        # Phase 1: parallel counting; each worker renders its own progress bar.
         total_lines = 0
-        with Pool(num_workers) as pool:
-            for lines_in_shard in pool.imap_unordered(_count_worker, worker_args):
-                total_lines += lines_in_shard
+        try:
+            with _GcSuspended():
+                # Phase 1: parallel counting; each worker renders its own
+                # progress bar.  On Unix/fork workers inherit the suspended-GC
+                # state; _count_worker also suspends GC for spawn platforms.
+                with Pool(num_workers) as pool:
+                    for lines_in_shard in pool.imap_unordered(_count_worker, worker_args):
+                        total_lines += lines_in_shard
 
-        # Phase 2: load and merge each shard sequentially.
-        for tmp_file in tqdm(tmp_files, desc="merging", unit="shard"):
-            with open(tmp_file, "rb") as f:
-                partial_counts, _ = pickle.load(f)
-            self.merge_counts(partial_counts)
-            os.unlink(tmp_file)
-        os.rmdir(tmp_dir)
+                # Phase 2: load and merge each shard sequentially.
+                for tmp_file in tqdm(tmp_files, desc="merging", unit="shard"):
+                    with open(tmp_file, "rb") as f:
+                        partial_counts, _ = pickle.load(f)
+                    self.merge_counts(partial_counts)
+                    os.unlink(tmp_file)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
         if total_lines == 0 or self.verbose > 0:
             print(
@@ -474,34 +541,42 @@ def _count_worker(args):
     """
     (filename, start, end, ngram_order, bos_symbol, eos_symbol, out_path,
      worker_idx) = args
-    local_counts = NgramCounts(ngram_order, bos_symbol=bos_symbol, eos_symbol=eos_symbol)
-    lines_processed = 0
-    with open(filename, "rb") as f:
-        f.seek(start)
-        with tqdm(
-            total=end - start,
-            position=worker_idx,
-            desc="worker {}".format(worker_idx),
-            unit="B",
-            unit_scale=True,
-            leave=False,
-        ) as pbar:
-            while f.tell() < end:
-                raw_line = f.readline()
-                if not raw_line:
-                    break
-                pbar.update(len(raw_line))
-                line = raw_line.decode(default_encoding).strip(strip_chars)
-                if ngram_order == 1 and line:
-                    parts = line.split()
-                    if parts:
-                        local_counts.add_raw_counts_from_line(parts[0])
-                else:
-                    local_counts.add_raw_counts_from_line(line)
-                lines_processed += 1
-    with open(out_path, "wb") as f:
-        pickle.dump((local_counts, lines_processed), f, protocol=pickle.HIGHEST_PROTOCOL)
-    return lines_processed
+    with _GcSuspended():
+        local_counts = NgramCounts(ngram_order, bos_symbol=bos_symbol, eos_symbol=eos_symbol)
+        lines_processed = 0
+        with open(filename, "rb") as f:
+            f.seek(start)
+            with tqdm(
+                total=end - start,
+                position=worker_idx,
+                desc="worker {}".format(worker_idx),
+                unit="B",
+                unit_scale=True,
+                leave=False,
+            ) as pbar:
+                pos = start
+                pending_update = 0
+                while pos < end:
+                    raw_line = f.readline()
+                    if not raw_line:
+                        break
+                    raw_len = len(raw_line)
+                    pos += raw_len
+                    pending_update += raw_len
+                    if pending_update >= 1024 * 1024 or pos >= end:
+                        pbar.update(pending_update)
+                        pending_update = 0
+                    line = raw_line.decode(default_encoding).strip(strip_chars)
+                    if ngram_order == 1 and line:
+                        parts = line.split()
+                        if parts:
+                            local_counts.add_raw_counts_from_line(parts[0])
+                    else:
+                        local_counts.add_raw_counts_from_line(line)
+                    lines_processed += 1
+        with open(out_path, "wb") as f:
+            pickle.dump((local_counts, lines_processed), f, protocol=pickle.HIGHEST_PROTOCOL)
+        return lines_processed
 
 
 def add_arguments(parser):
